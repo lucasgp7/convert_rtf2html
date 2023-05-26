@@ -13,10 +13,16 @@ def convert_rtf_to_html(rtf_file, html_file):
 conn, cursor, connected = connect_to_database()
 cursor = conn.cursor()
 
-# Criar um objeto ConfigParser, ler o config.properties e pega o valor do schema
+# Criar um objeto ConfigParser, ler o config.properties e pega o valor do database
 config = configparser.ConfigParser()
 config.read('config.properties')
-schema = config.get('schema', 'schema')
+database_type = config.get('database','database')
+# Valor do schema pois só existe schema no postgres no mysql é database apenas
+if database_type == 'postgresql':
+    schema = config.get('schema', 'schema')
+elif database_type == 'mysql':
+    schema = config.get('mysql', 'mysql.database')
+
 
 # Definir a tabela de entrada e a tabela de saída
 input_table = schema + ".laudo_legado"
@@ -26,24 +32,56 @@ output_table = schema + ".laudo_import_html"
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s %(levelname)s %(message)s')
 
-# Criar a tabela de saída se ela não existir
-create_table_query = f"""
-    CREATE TABLE IF NOT EXISTS {output_table}(
-        id SERIAL PRIMARY KEY,
-        id_laudo VARCHAR,
-        texto TEXT,
-        error_message TEXT,
-        dt_import_laudo TIMESTAMP,
-        convertido BOOLEAN DEFAULT FALSE 
-    )
+# Verificar o tipo de banco de dados para criar a tabela
+if database_type == 'postgresql':
+    create_table_query = f"""
+        CREATE TABLE IF NOT EXISTS {output_table}(
+            id SERIAL PRIMARY KEY,
+            id_laudo VARCHAR,
+            texto TEXT,
+            error_message TEXT,
+            dt_import_laudo TIMESTAMP,
+            convertido BOOLEAN DEFAULT FALSE 
+        )
 """
+elif database_type == 'mysql':
+    create_table_query = f"""
+            CREATE TABLE IF NOT EXISTS {output_table}(
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                id_laudo VARCHAR(255),
+                texto TEXT,
+                error_message TEXT,
+                dt_import_laudo DATETIME,
+                convertido BOOLEAN DEFAULT FALSE 
+            )
+        """
+else:
+    raise ValueError("Tipo de banco de dados inválido")
+# Criar a tabela de saída de acordo com o banco escolhido
 cursor.execute(create_table_query)
 conn.commit()
 
-# Adicionar um índice na coluna "id_laudo" da tabela de saída
-add_index_query = f"CREATE INDEX IF NOT EXISTS idx_id_laudo ON {output_table} (id_laudo)"
-cursor.execute(add_index_query)
-conn.commit()
+
+# Adicionar um índice na coluna "id_laudo" da tabela de saída de acordo com banco escolhido
+if database_type == 'postgresql':
+    add_index_query = f"CREATE INDEX IF NOT EXISTS idx_id_laudo ON {output_table} (id_laudo)"
+    cursor.execute(add_index_query)
+    conn.commit()
+elif database_type == 'mysql':
+    # Verificar se o índice já existe
+    existing_index_query = f"SHOW INDEX FROM {output_table} WHERE Key_name = 'idx_id_laudo'"
+    cursor.execute(existing_index_query)
+    existing_index = cursor.fetchone()
+
+    if existing_index is None:
+        # O índice não existe, então pode ser criado
+        add_index_query = f"ALTER TABLE {output_table} ADD INDEX idx_id_laudo (id_laudo)"
+        cursor.execute(add_index_query)
+        conn.commit()
+    else:
+        # O índice já existe
+        logging.info("O índice 'idx_id_laudo' já existe na tabela.")
+
 
 # Ler os dados da tabela de entrada
 select_query = f"SELECT idlaudo, laudo FROM {input_table} WHERE idlaudo IS NOT NULL AND idlaudo != ''"
@@ -52,7 +90,6 @@ rows = cursor.fetchall()
 
 # Obter o último id_laudo lido a partir do log (se existir)
 ultimo_id_laudo_lido = None
-# Aqui você pode adicionar a lógica para obter o último id_laudo lido do seu serviço
 
 # Iterar pelas linhas da tabela de entrada
 for idlaudo, laudo in rows:
@@ -84,10 +121,19 @@ for row in rows:
         continue
 
     # Salvar o conteúdo do RTF em um arquivo temporário
-    with open(rtf_file, "wb") as file:
-        file.write(rtf_text)
-    # Nome do arquivo HTML
-    html_file = f"output_{file_id}.html"
+    if database_type == 'postgresql':
+        with open(rtf_file, "wb") as file:
+            file.write(rtf_text)
+        # Nome do arquivo HTML
+        html_file = f"output_{file_id}.html"
+    elif database_type == 'mysql':
+        # Supondo que 'rtf_text' seja uma string
+        # Abra o arquivo em modo de escrita binária ('wb') para aceitar objetos de bytes
+        with open(rtf_file, 'wb') as file:
+            # Converta a string em bytes usando a codificação 'utf-8'
+            file.write(rtf_text.encode('utf-8'))
+        # Nome do arquivo HTML
+        html_file = f"output_{file_id}.html"
 
     try:
         # Converter o arquivo RTF para HTML
@@ -156,5 +202,5 @@ for row in rows:
 cursor.close()
 conn.close()
 # Finalização da conversão no log
-logging.info("Conversão concluída. Os arquivos RTF foram convertidos para HTML e salvos na tabela do PostgreSQL.")
+logging.info("Conversão concluída. Os arquivos RTF foram convertidos para HTML e salvos na tabela do " + (database_type))
 
