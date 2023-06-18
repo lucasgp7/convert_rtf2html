@@ -1,13 +1,43 @@
 import os
 import datetime
 import aspose.words as aw
-import logging
+import base64
 from bs4 import BeautifulSoup
 from connect import *
+import re
 
 def convert_rtf_to_html(rtf_file, html_file):
     doc = aw.Document(rtf_file)
     doc.save(html_file)
+
+def has_image_in_rtf(rtf_file):
+    with open(rtf_file, "r", encoding="latin-1") as file:
+        rtf_content = file.read()
+
+    if "\\pict" in rtf_content:
+        return True
+    else:
+        return False
+
+def process_rtf_file(rtf_file, output_table, file_id):
+    try:
+        # Verificar se o RTF tem imagem
+        if has_image_in_rtf(rtf_file):
+            has_image = True
+            # Insere True na coluna 'tem_imagem'
+            insert_query = f"UPDATE {output_table} SET tem_imagem = %s WHERE id_laudo = %s"
+            cursor.execute(insert_query, (has_image, file_id))
+            conn.commit()
+            logging.info("O arquivo RTF contém imagens.")
+        else:
+            has_image = False
+            # Insere False na coluna 'tem_imagem'
+            insert_query = f"UPDATE {output_table} SET tem_imagem = %s WHERE id_laudo = %s"
+            cursor.execute(insert_query, (has_image, file_id))
+            conn.commit()
+            logging.info("O arquivo RTF não contém imagens.")
+    except Exception as e:
+        logging.error(f"Ocorreu um erro ao processar o arquivo RTF: {e}")
 
 # Utilização da função de conexão do banco
 conn, cursor, connected = connect_to_database()
@@ -32,7 +62,6 @@ output_table = schema + ".laudo_import_html"
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s %(levelname)s %(message)s')
 
-# Verificar o tipo de banco de dados para criar a tabela
 if database_type == 'postgresql':
     create_table_query = f"""
         CREATE TABLE IF NOT EXISTS {output_table}(
@@ -41,7 +70,8 @@ if database_type == 'postgresql':
             texto TEXT,
             error_message TEXT,
             dt_import_laudo TIMESTAMP,
-            convertido BOOLEAN DEFAULT FALSE 
+            convertido BOOLEAN DEFAULT FALSE,
+            tem_imagem BOOLEAN
         )
 """
 elif database_type == 'mysql':
@@ -52,7 +82,8 @@ elif database_type == 'mysql':
                 texto TEXT,
                 error_message TEXT,
                 dt_import_laudo DATETIME,
-                convertido BOOLEAN DEFAULT FALSE 
+                convertido BOOLEAN DEFAULT FALSE,
+                tem_imagem TINYINT(1)
             )
         """
 else:
@@ -102,6 +133,10 @@ current_datetime = datetime.datetime.now()
 
 errors = []  # Lista para armazenar os erros encontrados
 
+# Variáveis contadoras
+total_laudos_processados = 0
+laudos_convertidos = 0
+
 # Converter cada arquivo RTF para HTML e salvar na tabela de saída
 for row in rows:
     file_id, rtf_text = row
@@ -143,17 +178,40 @@ for row in rows:
         with open(html_file, "r", encoding="utf-8") as file:
             html_text = file.read()
 
-        # Remover a tag <img> e seu conteúdo
+            # Encontrar todas as tags <img> no HTML
+            soup = BeautifulSoup(html_text, "html.parser")
+            img_tags = soup.find_all("img")
+
+            # Remover a primeira tag <img>, se existir
+            if len(img_tags) > 0:
+                img_tags[0].extract()
+
+            # Converter e substituir as imagens por base64
+            for img_tag in img_tags:
+                # Obter o caminho da imagem
+                image_path = img_tag["src"]
+
+                # Ler a imagem em bytes
+                with open(image_path, "rb") as image_file:
+                    image_data = image_file.read()
+
+                # Converter a imagem para base64
+                base64_data = base64.b64encode(image_data).decode("utf-8")
+
+                # Substituir o caminho da imagem pelo código base64 na tag <img>
+                img_tag["src"] = "data:image/png;base64," + base64_data
+
+            # Obter o HTML modificado
+            html_text = str(soup)
+
+        # Remover tags do conteudo HTML
         soup = BeautifulSoup(html_text, "html.parser")
-        for img_tag in soup.find_all("img"):
-            img_tag.extract()
 
-        for table in soup.find_all('table'):
-            table.extract()
-
+        #Remove o atributo style de todas as tags:
         for tag in soup.find_all(True):
             tag.attrs = {key: value for key, value in tag.attrs.items() if key != 'style'}
 
+        #Itera sobre todas as tags e remove as tags vazias:
         for tag in soup.find_all(True):
             if tag.string and tag.string.strip() == '':
                 tag.extract()
@@ -179,8 +237,14 @@ for row in rows:
         cursor.execute(insert_query, (file_id, body_content, current_datetime, True))
         conn.commit()
 
+        # Insere no banco se o RTF tem imagem
+        process_rtf_file(rtf_file, output_table, file_id)
+
         # Registrar as informações relevantes no log
         logging.info(f"ID Laudo: {file_id} importado com sucesso")
+
+        # Laudo convertido com sucesso
+        laudos_convertidos += 1
 
         # Atualizar o último id_laudo lido no seu serviço
         ultimo_id_laudo_lido = file_id
@@ -194,13 +258,28 @@ for row in rows:
             if filename.endswith(('.png', '.jpeg', '.jpg')):
                 os.remove(filename)
 
-    # Registrar eventuais erros no log
     except Exception as e:
-        logging.error(f"Erro ao converter o arquivo ID: {file_id} - {str(e)}")
+        # Tratar e registrar o erro encontrado
+        error_message = str(e)
+
+        # Inserir o laudo com erro na tabela de saída
+        insert_query = f"INSERT INTO {output_table} (id_laudo, error_message, dt_import_laudo, convertido) VALUES (%s, %s, %s, %s)"
+        current_datetime = datetime.datetime.now()
+        cursor.execute(insert_query, (file_id, error_message, current_datetime, False))
+        conn.commit()
+
+        ## Registrar as informações relevantes no log
+        logging.error(f"Erro ao processar o laudo {file_id}: {error_message}")
+
+    # Laudo processado, independente do resultado
+    total_laudos_processados += 1
+
+## Registrar as informações relevantes no log
+logging.info(f"Total de laudos processados: {total_laudos_processados}")
+logging.info(f"Total de laudos convertidos com sucesso: {laudos_convertidos}")
 
 # Fechar a conexão
 cursor.close()
 conn.close()
 # Finalização da conversão no log
 logging.info("Conversão concluída. Os arquivos RTF foram convertidos para HTML e salvos na tabela do " + (database_type))
-
